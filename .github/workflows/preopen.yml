@@ -1,0 +1,51 @@
+name: Pre-open top 5
+
+on:
+  schedule:
+    - cron: "5 3 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      now:
+        description: "Fetch immediately (for testing outside 9:10)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: preopen
+  cancel-in-progress: false
+
+jobs:
+  card:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          sudo apt-get install -y -q fonts-dejavu-core
+          pip install -q pandas requests pillow
+      - name: Build and send card
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NSE_HOLIDAYS: ${{ vars.NSE_HOLIDAYS }}
+          PREOPEN_KEY: FO
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.now }}" = "true" ]; then
+            python preopen_bot.py --now
+          else
+            python preopen_bot.py
+          fi
+      - name: Save debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_id }}
+          path: |
+            debug/
+            preopen-top5-*.png
+          retention-days: 7
+          if-no-files-found: ignore
