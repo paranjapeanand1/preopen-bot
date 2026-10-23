@@ -8,7 +8,7 @@ sends a Telegram alert so you can fall back to a manual CSV upload.
 Local test without NSE or Telegram:
     python preopen_bot.py --csv MW-Pre-Open-Market-FO-19-Oct-2026.csv --no-send
 """
-import argparse, io, math, os, re, sys, time, traceback
+import argparse, io, math, os, re, sys, time, traceback, zipfile, json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -125,6 +125,7 @@ def json_to_df(js):
             "BEST ASK PRICE": ba[0], "BEST ASK QTY": ba[1],
             "%CHANGE": m.get("pChange", p.get("perChange")),
             "FINAL PRICE": p.get("finalPrice") or m.get("iep") or m.get("lastPrice"),
+            "FINAL VOLUME": p.get("finalQuantity") or m.get("finalQuantity") or 0,
         })
     return pd.DataFrame(rows).astype(str)
 
@@ -163,6 +164,8 @@ def analyse(df):
         aq = num(r["BEST ASK QTY"]); aq = 0 if math.isnan(aq) else int(aq)
         bid, ask = num(r["BEST BID PRICE"]), num(r["BEST ASK PRICE"])
         side = "BID" if abs(fp - bid) < 1e-3 else "ASK" if abs(fp - ask) < 1e-3 else "MID"
+        if side == "MID":
+            continue  # final price must equal best bid or best ask
         un = bq if side == "BID" else aq if side == "ASK" else 0
         ot = aq if side == "BID" else bq if side == "ASK" else 0
         ratio = (un + 1) / (ot + 1) if side != "MID" else 1
@@ -272,27 +275,244 @@ def caption(top, b, date_label):
     return "\n".join(lines)
 
 
+
+# ================================================================ MOMENTUM (separate list)
+# Direction-free: which stocks are likely to MOVE in the first 15 minutes.
+# Score = gap (40) + relative pre-open volume (30) + leftover order value (30).
+# Relative volume = pre-open volume / 20-day average daily volume (from NSE bhavcopy).
+ARCH_NEW = "https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{d:%Y%m%d}_F_0000.csv.zip"
+ARCH_OLD = "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{d:%d%m%Y}.csv"
+AVG_DAYS = 20
+
+
+def _bhav_day(s, d):
+    for url in (ARCH_NEW.format(d=d), ARCH_OLD.format(d=d)):
+        try:
+            r = s.get(url, timeout=20)
+            if r.status_code != 200 or len(r.content) < 1000:
+                continue
+            if url.endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                    raw = z.read(z.namelist()[0]).decode("utf-8-sig")
+            else:
+                raw = r.content.decode("utf-8-sig")
+            t = pd.read_csv(io.StringIO(raw), dtype=str)
+            t.columns = [c.strip() for c in t.columns]
+            if "TckrSymb" in t.columns:
+                t = t[t["SctySrs"].str.strip() == "EQ"]; sym, vol = t["TckrSymb"], t["TtlTradgVol"]
+            elif "SYMBOL" in t.columns:
+                t = t[t["SERIES"].str.strip() == "EQ"]; sym, vol = t["SYMBOL"], t["TTL_TRD_QNTY"]
+            else:
+                continue
+            v = pd.to_numeric(vol.str.replace(",", "").str.strip(), errors="coerce")
+            return dict(zip(sym.str.strip(), v))
+        except Exception as e:
+            print("Bhavcopy", d, url[-30:], "failed:", e)
+    return None
+
+
+def avg_volumes(s, today):
+    """20-day average daily volume per symbol, from NSE's daily bhavcopy files."""
+    vols, got, d = {}, 0, today - timedelta(days=1)
+    for _ in range(45):
+        if got >= AVG_DAYS:
+            break
+        if d.weekday() < 5:
+            day = _bhav_day(s, d)
+            if day:
+                for k, v in day.items():
+                    if v == v:
+                        vols.setdefault(k, []).append(v)
+                got += 1
+        d -= timedelta(days=1)
+    print(f"Average volume built from {got} bhavcopy days")
+    if got < 5:
+        return {}
+    need = max(3, got // 2)
+    return {k: sum(v) / len(v) for k, v in vols.items() if len(v) >= need}
+
+
+# ---- Primary source: Upstox public historical candles (no login or token needed)
+UPSTOX_MASTER = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+UPSTOX_CANDLE = "https://api.upstox.com/v3/historical-candle/{key}/days/1/{to}/{frm}"
+
+
+def avg_volumes_upstox(symbols, today):
+    """20-day average daily volume for each symbol from Upstox daily candles.
+    Uses only sessions before today. Returns {symbol: avg volume}."""
+    import gzip
+    from urllib.parse import quote
+    from concurrent.futures import ThreadPoolExecutor
+    r = requests.get(UPSTOX_MASTER, timeout=60)
+    r.raise_for_status()
+    inst = json.loads(gzip.decompress(r.content))
+    keys = {i.get("trading_symbol", "").upper(): i.get("instrument_key")
+            for i in inst if i.get("segment") == "NSE_EQ" and i.get("instrument_type") == "EQ"}
+    if not symbols:   # before pre-open: use today's F&O stock list from the same file
+        by_key = {v: k for k, v in keys.items()}
+        symbols = sorted({by_key.get(i.get("underlying_key")) for i in inst
+                          if i.get("segment") == "NSE_FO" and i.get("instrument_type") == "FUT"
+                          and str(i.get("underlying_key", "")).startswith("NSE_EQ|")} - {None})
+        print(f"Upstox: {len(symbols)} F&O stocks in instrument master")
+    to = (today - timedelta(days=1)).isoformat()
+    frm = (today - timedelta(days=45)).isoformat()
+
+    def one(sym):
+        k = keys.get(sym.upper())
+        if not k:
+            return sym, None
+        url = UPSTOX_CANDLE.format(key=quote(k, safe=""), to=to, frm=frm)
+        for attempt in range(3):
+            try:
+                resp = requests.get(url, headers={"Accept": "application/json"}, timeout=20)
+                if resp.status_code == 429:
+                    time.sleep(2 + attempt * 2); continue
+                resp.raise_for_status()
+                c = resp.json().get("data", {}).get("candles", [])
+                c = sorted(c, key=lambda x: x[0], reverse=True)          # newest first
+                c = [x for x in c if str(x[0])[:10] < today.isoformat()][:AVG_DAYS]
+                vols = [float(x[5]) for x in c if x[5] is not None]
+                return sym, (sum(vols) / len(vols) if len(vols) >= 10 else None)
+            except Exception as e:
+                last = e
+                time.sleep(1)
+        print("Upstox candles failed for", sym, last)
+        return sym, None
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        res = dict(ex.map(one, symbols))
+    out = {k: v for k, v in res.items() if v}
+    print(f"Upstox: 20-day average volume for {len(out)} of {len(symbols)} symbols")
+    return out
+
+
+def get_avg_volumes(symbols, today):
+    """Upstox first; NSE bhavcopy only if Upstox covers under 80% of stocks."""
+    src = ""
+    avgv = {}
+    try:
+        avgv = avg_volumes_upstox(symbols, today); src = "Upstox"
+    except Exception as e:
+        print("Upstox average volume failed:", e)
+    if len(avgv) < 150 if not symbols else len(avgv) < 0.8 * len(symbols):
+        try:
+            nse = avg_volumes(nse_session(), today)
+            if len(nse) > len(avgv):
+                avgv, src = nse, "NSE bhavcopy"
+        except Exception as e:
+            print("NSE bhavcopy fallback failed:", e)
+    return avgv, src
+
+
+def momentum(df, avgv):
+    rows = []
+    for _, r in df.iterrows():
+        fp = num(r["FINAL PRICE"])
+        if math.isnan(fp):
+            continue
+        sym = str(r["SYMBOL"]).strip()
+        g = num(r["%CHANGE"]); g = 0.0 if math.isnan(g) else g
+        fv = num(r.get("FINAL VOLUME", 0)); fv = 0 if math.isnan(fv) else fv
+        bq = num(r["BEST BID QTY"]); bq = 0 if math.isnan(bq) else bq
+        aq = num(r["BEST ASK QTY"]); aq = 0 if math.isnan(aq) else aq
+        left_q = max(bq, aq); left_side = "buyers" if bq >= aq else "sellers"
+        left_l = left_q * fp / 1e5                         # ₹ lakh
+        gp = min(abs(g) / 3, 1) * 40
+        av = avgv.get(sym)
+        if av:
+            rv = fv / av * 100                              # % of a normal day
+            vp = min(math.log10(1 + rv / 0.1) / math.log10(51), 1) * 30   # full at 5%
+        else:
+            rv = None                                       # no history: fall back to turnover
+            vp = min(math.log10(fv * fp / 1e7 + 1) / math.log10(51), 1) * 30
+        lp = min(math.log10(left_l + 1) / 2.5, 1) * 30
+        rows.append(dict(sym=sym, g=g, fp=fp, rv=rv, left_l=left_l, left_side=left_side,
+                         gp=gp, vp=vp, lp=lp, score=round(gp + vp + lp)))
+    rows.sort(key=lambda x: -x["score"])
+    return rows[:5]
+
+
+def build_momentum_card(top, out, date_label, rv_ok, src=""):
+    W, P, CH = 1080, 48, 250
+    ACC = "#5B4FCF"
+    H = 230 + len(top) * (CH + 22) + 130
+    im = Image.new("RGB", (W, H), BG); dr = ImageDraw.Draw(im)
+    rr = lambda box, fill, r=24, outline=None, w=0: dr.rounded_rectangle(box, r, fill=fill, outline=outline, width=w)
+    dr.text((P, 44), "Momentum top 5", font=font(52, True), fill=FG)
+    dr.text((P, 112), f"{date_label}  ·  {UNIVERSE}  ·  likely movers, no direction", font=font(28), fill=MUT)
+    dr.text((P, 160), "Trade the 9:15 breakout either way  ·  exit by 9:30", font=font(28, True), fill=ACC)
+    y = 222
+    for i, x in enumerate(top):
+        rr((P, y, W - P, y + CH), CARD, 28, outline=LINE, w=2)
+        dr.rectangle((P + 2, y + 26, P + 12, y + CH - 26), fill=ACC)
+        ix = P + 40
+        dr.text((ix, y + 26), f"#{i+1}", font=font(26), fill=MUT)
+        dr.text((ix + 56, y + 18), x["sym"], font=font(42, True), fill=FG)
+        st = str(x["score"]); sx = W - P - 40
+        dr.text((sx - dr.textlength(st, font=font(56, True)), y + 16), st, font=font(56, True), fill=ACC)
+        dr.text((sx - dr.textlength("score", font=font(24)), y + 86), "score", font=font(24), fill=MUT)
+        gc = "#2E7D32" if x["g"] > 0 else "#C62828" if x["g"] < 0 else FG
+        dr.text((ix, y + 84), f"{'+' if x['g'] > 0 else ''}{x['g']:.2f}%", font=font(48, True), fill=gc)
+        dr.text((ix + 250, y + 98), "gap", font=font(24), fill=MUT)
+        # three mini bars
+        by = y + 160; cw = (W - 2 * P - 80 - 40) / 3
+        parts = [("Gap", x["gp"], 40, f"{abs(x['g']):.2f}%"),
+                 ("Pre-open vol", x["vp"], 30, (f"{x['rv']:.1f}% of normal day" if x["rv"] is not None else "turnover (no history)")),
+                 ("Leftover", x["lp"], 30, f"₹{x['left_l']:,.0f} L {x['left_side']}")]
+        for j, (lab, pts, mx, txt) in enumerate(parts):
+            bx = ix + j * (cw + 20)
+            dr.text((bx, by - 4), lab, font=font(22), fill=MUT)
+            rr((bx, by + 26, bx + cw, by + 38), "#E6E3F7", 6)
+            rr((bx, by + 26, bx + max(12, cw * pts / mx), by + 38), ACC, 6)
+            dr.text((bx, by + 46), txt, font=font(21), fill=FG)
+        y += CH + 22
+    dr.text((P, y + 10), "Score = gap (40) + pre-open volume vs 20-day average (30) + leftover order value (30)", font=font(22), fill=MUT)
+    dr.text((P, y + 44), "Test list, not a direction call. Educational only, not investment advice.", font=font(22), fill=MUT)
+    if not rv_ok:
+        dr.text((P, y + 78), "20-day volume history unavailable today; used pre-open turnover instead.", font=font(22), fill="#B26A00")
+    elif src:
+        dr.text((P, y + 78), f"20-day average volume source: {src}", font=font(22), fill=MUT)
+    im.save(out)
+
+
+def momentum_caption(top, date_label):
+    lines = [f"Momentum top 5 · {date_label} · trade the breakout either way, exit by 9:30"]
+    for i, x in enumerate(top):
+        rv = f"{x['rv']:.1f}% of normal vol" if x["rv"] is not None else "turnover"
+        lines.append(f"{i+1}. {x['sym']} · gap {x['g']:+.2f}% · {rv} · score {x['score']}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", help="Use a downloaded CSV instead of fetching from NSE")
     ap.add_argument("--now", action="store_true", help="Fetch immediately, don't wait for 9:10")
     ap.add_argument("--no-send", action="store_true", help="Don't send to Telegram")
+    ap.add_argument("--date", help="Date label for --csv tests, e.g. 2026-10-19")
+    ap.add_argument("--avgvol", help="JSON file {symbol: avg volume} for --csv tests")
     a = ap.parse_args()
     global TOKEN
     if a.no_send:
         TOKEN = ""
 
-    today = datetime.now(IST).date()
+    today = datetime.strptime(a.date, "%Y-%m-%d").date() if a.date else datetime.now(IST).date()
     date_label = today.strftime("%a %d %b %Y")
     note = ""
+    avgv, src = {}, ""
 
     if a.csv:
+        if a.avgvol:
+            avgv, src = json.load(open(a.avgvol)), "test file"
         df = pd.read_csv(a.csv, encoding="utf-8-sig", dtype=str)
         df.columns = [c.strip() for c in df.columns]
     else:
         if today.isoformat() in HOLIDAYS:
             print("NSE holiday, nothing to do"); return
+        try:                                   # uses the 8:35–9:10 waiting time
+            avgv, src = get_avg_volumes(None, today)
+        except Exception as e:
+            print("Average volume prefetch failed:", e)
         if not a.now:
             wait_until(FETCH_AT)
         df, last_err = None, None
@@ -332,6 +552,21 @@ def main():
     print(cap)
     with open(out, "rb") as f:
         tg("sendPhoto", {"caption": cap}, files={"photo": f})
+
+    # second card: momentum list (separate test; never affects the card above)
+    try:
+        if not a.csv and not avgv:   # prefetch failed: one late attempt
+            avgv, src = get_avg_volumes([str(x).strip() for x in df["SYMBOL"]], today)
+        mtop = momentum(df, avgv)
+        mout = f"momentum-top5-{today:%d-%b-%Y}.png"
+        build_momentum_card(mtop, mout, date_label, bool(avgv), src)
+        mcap = momentum_caption(mtop, date_label)
+        print(mcap)
+        with open(mout, "rb") as f:
+            tg("sendPhoto", {"caption": mcap}, files={"photo": f})
+    except Exception:
+        traceback.print_exc()
+        alert("Momentum card failed today (the main card above is unaffected).")
 
 
 if __name__ == "__main__":
