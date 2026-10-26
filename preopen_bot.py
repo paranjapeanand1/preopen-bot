@@ -483,6 +483,47 @@ def momentum_caption(top, date_label):
     return "\n".join(lines)
 
 
+# ================================================================ WATCHLIST (3rd card)
+def build_watchlist_card(pre_syms, mom_syms, out, date_label):
+    """Plain list of every stock on either card; ✓ per card, ★ when on both."""
+    common = [x for x in pre_syms if x in mom_syms]
+    rows = common + [x for x in pre_syms if x not in common] + [x for x in mom_syms if x not in pre_syms]
+    W, P, RH = 1080, 48, 92
+    H = 300 + len(rows) * RH + 110
+    im = Image.new("RGB", (W, H), BG); dr = ImageDraw.Draw(im)
+    dr.text((P, 44), "Watchlist", font=font(52, True), fill=FG)
+    dr.text((P, 112), date_label, font=font(30), fill=MUT)
+    cols = [("Stock", P + 24), ("Pre-open", 520), ("Momentum", 720), ("Focus", 930)]
+    y = 190
+    dr.rounded_rectangle((P, y, W - P, y + 70), 18, fill=FG)
+    for name, x in cols:
+        f = font(28, True)
+        tx = x if name == "Stock" else x - dr.textlength(name, font=f) / 2
+        dr.text((tx, y + 18), name, font=f, fill="#FFFFFF")
+    y += 82
+    for i, sym in enumerate(rows):
+        star = sym in common
+        fill = "#FFF6DA" if star else (CARD if i % 2 == 0 else "#F1EFE8")
+        dr.rounded_rectangle((P, y, W - P, y + RH - 10), 16, fill=fill,
+                             outline="#E0B33A" if star else LINE, width=3 if star else 1)
+        cy = y + (RH - 10) / 2
+        dr.text((P + 24, cy - 22), sym, font=font(38, True), fill=FG)
+        for flag, x in ((sym in pre_syms, 520), (sym in mom_syms, 720)):
+            if flag:
+                dr.line([(x - 16, cy + 2), (x - 4, cy + 14), (x + 18, cy - 14)], fill="#2E7D32", width=7)
+        if star:
+            r1, r2 = 24, 10
+            pts = [(930 + (r1 if k % 2 == 0 else r2) * math.sin(math.pi * k / 5),
+                    cy - (r1 if k % 2 == 0 else r2) * math.cos(math.pi * k / 5)) for k in range(10)]
+            dr.polygon(pts, fill="#E0A800")
+        y += RH
+    dr.text((P, y + 14), f"★ on both cards: {len(common)}   ·   total stocks: {len(rows)}", font=font(26, True), fill=FG)
+    dr.text((P, y + 52), "Educational only, not investment advice.", font=font(22), fill=MUT)
+    im.save(out)
+    cap = f"Watchlist · {date_label}\n★ Both cards: " + (", ".join(common) if common else "none")
+    return cap
+
+
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
@@ -567,6 +608,18 @@ def main():
     except Exception:
         traceback.print_exc()
         alert("Momentum card failed today (the main card above is unaffected).")
+        mtop = []
+
+    # third card: watchlist (all stocks from both cards, common ones starred)
+    try:
+        wout = f"watchlist-{today:%d-%b-%Y}.png"
+        wcap = build_watchlist_card([x["sym"] for x in top], [x["sym"] for x in mtop], wout, date_label)
+        print(wcap)
+        with open(wout, "rb") as f:
+            tg("sendPhoto", {"caption": wcap}, files={"photo": f})
+    except Exception:
+        traceback.print_exc()
+        alert("Watchlist card failed today (the other cards are unaffected).")
 
 
 if __name__ == "__main__":
