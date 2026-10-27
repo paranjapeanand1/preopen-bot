@@ -404,6 +404,9 @@ def get_avg_volumes(symbols, today):
     return avgv, src
 
 
+# Blast watch flag: unusual pre-open volume + real gap. Flagged stocks always get a slot on the card.
+BLAST_RV, BLAST_GAP = 4.0, 1.5      # pre-open vol >= 4% of 20-day avg AND |gap| >= 1.5%
+
 def momentum(df, avgv):
     rows = []
     for _, r in df.iterrows():
@@ -427,15 +430,25 @@ def momentum(df, avgv):
             vp = min(math.log10(fv * fp / 1e7 + 1) / math.log10(51), 1) * 30
         lp = min(math.log10(left_l + 1) / 2.5, 1) * 30
         rows.append(dict(sym=sym, g=g, fp=fp, rv=rv, left_l=left_l, left_side=left_side,
-                         gp=gp, vp=vp, lp=lp, score=round(gp + vp + lp)))
+                         gp=gp, vp=vp, lp=lp, score=round(gp + vp + lp),
+                         blast=rv is not None and rv >= BLAST_RV and abs(g) >= BLAST_GAP))
     rows.sort(key=lambda x: -x["score"])
-    return rows[:5]
+    top = rows[:5]
+    for x in rows[5:]:                                  # guarantee a slot for flagged stocks
+        if x["blast"]:
+            free = [i for i, t in enumerate(top) if not t["blast"]]
+            if not free:
+                break
+            top[free[-1]] = x
+    top.sort(key=lambda x: -x["score"])
+    return top
 
 
 def build_momentum_card(top, out, date_label, rv_ok, src=""):
     W, P, CH = 1080, 48, 250
     ACC = "#5B4FCF"
-    H = 230 + len(top) * (CH + 22) + 130
+    BL, BLB = "#D84315", "#FDE7DF"
+    H = 230 + len(top) * (CH + 22) + 164
     im = Image.new("RGB", (W, H), BG); dr = ImageDraw.Draw(im)
     rr = lambda box, fill, r=24, outline=None, w=0: dr.rounded_rectangle(box, r, fill=fill, outline=outline, width=w)
     dr.text((P, 44), "Momentum top 5", font=font(52, True), fill=FG)
@@ -443,11 +456,17 @@ def build_momentum_card(top, out, date_label, rv_ok, src=""):
     dr.text((P, 160), "Trade the 9:15 breakout either way  ·  exit by 9:30", font=font(28, True), fill=ACC)
     y = 222
     for i, x in enumerate(top):
-        rr((P, y, W - P, y + CH), CARD, 28, outline=LINE, w=2)
-        dr.rectangle((P + 2, y + 26, P + 12, y + CH - 26), fill=ACC)
+        bl = x.get("blast")
+        rr((P, y, W - P, y + CH), CARD, 28, outline=BL if bl else LINE, w=4 if bl else 2)
+        dr.rectangle((P + 2, y + 26, P + 12, y + CH - 26), fill=BL if bl else ACC)
         ix = P + 40
         dr.text((ix, y + 26), f"#{i+1}", font=font(26), fill=MUT)
         dr.text((ix + 56, y + 18), x["sym"], font=font(42, True), fill=FG)
+        if bl:
+            bx = ix + 56 + dr.textlength(x["sym"], font=font(42, True)) + 20
+            lab = "BLAST WATCH"; tw = dr.textlength(lab, font=font(24, True))
+            rr((bx, y + 24, bx + tw + 36, y + 66), BLB, 21)
+            dr.text((bx + 18, y + 31), lab, font=font(24, True), fill=BL)
         st = str(x["score"]); sx = W - P - 40
         dr.text((sx - dr.textlength(st, font=font(56, True)), y + 16), st, font=font(56, True), fill=ACC)
         dr.text((sx - dr.textlength("score", font=font(24)), y + 86), "score", font=font(24), fill=MUT)
@@ -467,7 +486,9 @@ def build_momentum_card(top, out, date_label, rv_ok, src=""):
             dr.text((bx, by + 46), txt, font=font(21), fill=FG)
         y += CH + 22
     dr.text((P, y + 10), "Score = gap (40) + pre-open volume vs 20-day average (30) + leftover order value (30)", font=font(22), fill=MUT)
-    dr.text((P, y + 44), "Test list, not a direction call. Educational only, not investment advice.", font=font(22), fill=MUT)
+    dr.text((P, y + 44), f"Blast watch = pre-open volume ≥{BLAST_RV:g}% of normal day + gap ≥{BLAST_GAP:g}% (always shown)", font=font(22, True), fill="#D84315")
+    dr.text((P, y + 78), "Test list, not a direction call. Educational only, not investment advice.", font=font(22), fill=MUT)
+    y += 34
     if not rv_ok:
         dr.text((P, y + 78), "20-day volume history unavailable today; used pre-open turnover instead.", font=font(22), fill="#B26A00")
     elif src:
@@ -479,18 +500,42 @@ def momentum_caption(top, date_label):
     lines = [f"Momentum top 5 · {date_label} · trade the breakout either way, exit by 9:30"]
     for i, x in enumerate(top):
         rv = f"{x['rv']:.1f}% of normal vol" if x["rv"] is not None else "turnover"
-        lines.append(f"{i+1}. {x['sym']} · gap {x['g']:+.2f}% · {rv} · score {x['score']}")
+        lines.append(f"{i+1}. {x['sym']} · gap {x['g']:+.2f}% · {rv} · score {x['score']}"
+                     + (" · ⚡ BLAST WATCH" if x.get("blast") else ""))
     return "\n".join(lines)
 
 
 # ================================================================ WATCHLIST (3rd card)
-def build_watchlist_card(pre_syms, mom_syms, out, date_label):
-    """Plain list of every stock on either card; ✓ per card, ★ when on both."""
+def burst_icon(size):
+    """Explosion burst icon (red outer, orange middle, yellow core), anti-aliased."""
+    S = size * 4; c = S / 2
+    im = Image.new("RGBA", (S, S), (0, 0, 0, 0)); d = ImageDraw.Draw(im)
+    peaks = [1.0, 0.80, 0.94, 0.74, 1.0, 0.84, 0.90, 0.76, 0.97, 0.82, 0.92]
+    n = len(peaks)
+    def ring(scale, valley, rot=0.0):
+        pts = []
+        for k in range(n):
+            a = 2 * math.pi * k / n + rot
+            r = peaks[k] * scale * c
+            pts.append((c + r * math.sin(a), c - r * math.cos(a)))
+            a2 = a + math.pi / n
+            pts.append((c + valley * scale * c * math.sin(a2), c - valley * scale * c * math.cos(a2)))
+        return pts
+    d.polygon(ring(0.98, 0.50), fill="#D32F2F")
+    d.polygon(ring(0.68, 0.48, 0.12), fill="#F57C00")
+    d.polygon(ring(0.36, 0.55, 0.25), fill="#FFC107")
+    return im.resize((size, size), Image.LANCZOS)
+
+
+def build_watchlist_card(pre_syms, mom_syms, out, date_label, blast_syms=()):
+    """Plain list of every stock on either card; ✓ per card, ★ when on both,
+    burst icon next to the name for blast-watch stocks."""
     common = [x for x in pre_syms if x in mom_syms]
     rows = common + [x for x in pre_syms if x not in common] + [x for x in mom_syms if x not in pre_syms]
     W, P, RH = 1080, 48, 92
-    H = 300 + len(rows) * RH + 110
+    H = 300 + len(rows) * RH + 110 + (44 if blast_syms else 0)
     im = Image.new("RGB", (W, H), BG); dr = ImageDraw.Draw(im)
+    bicon = burst_icon(52)
     dr.text((P, 44), "Watchlist", font=font(52, True), fill=FG)
     dr.text((P, 112), date_label, font=font(30), fill=MUT)
     cols = [("Stock", P + 24), ("Pre-open", 520), ("Momentum", 720), ("Focus", 930)]
@@ -508,6 +553,9 @@ def build_watchlist_card(pre_syms, mom_syms, out, date_label):
                              outline="#E0B33A" if star else LINE, width=3 if star else 1)
         cy = y + (RH - 10) / 2
         dr.text((P + 24, cy - 22), sym, font=font(38, True), fill=FG)
+        if sym in blast_syms:
+            bx = int(P + 24 + dr.textlength(sym, font=font(38, True)) + 14)
+            im.paste(bicon, (bx, int(cy - 26)), bicon)
         for flag, x in ((sym in pre_syms, 520), (sym in mom_syms, 720)):
             if flag:
                 dr.line([(x - 16, cy + 2), (x - 4, cy + 14), (x + 18, cy - 14)], fill="#2E7D32", width=7)
@@ -518,9 +566,17 @@ def build_watchlist_card(pre_syms, mom_syms, out, date_label):
             dr.polygon(pts, fill="#E0A800")
         y += RH
     dr.text((P, y + 14), f"★ on both cards: {len(common)}   ·   total stocks: {len(rows)}", font=font(26, True), fill=FG)
+    if blast_syms:
+        small = burst_icon(34)
+        im.paste(small, (P, int(y + 50)), small)
+        dr.text((P + 44, y + 54), f"Blast watch = pre-open volume ≥{BLAST_RV:g}% of normal day + gap ≥{BLAST_GAP:g}%",
+                font=font(22, True), fill="#D84315")
+        y += 44
     dr.text((P, y + 52), "Educational only, not investment advice.", font=font(22), fill=MUT)
     im.save(out)
     cap = f"Watchlist · {date_label}\n★ Both cards: " + (", ".join(common) if common else "none")
+    if blast_syms:
+        cap += "\n💥 Blast watch: " + ", ".join(blast_syms)
     return cap
 
 
@@ -613,7 +669,8 @@ def main():
     # third card: watchlist (all stocks from both cards, common ones starred)
     try:
         wout = f"watchlist-{today:%d-%b-%Y}.png"
-        wcap = build_watchlist_card([x["sym"] for x in top], [x["sym"] for x in mtop], wout, date_label)
+        wcap = build_watchlist_card([x["sym"] for x in top], [x["sym"] for x in mtop], wout, date_label,
+                                    [x["sym"] for x in mtop if x.get("blast")])
         print(wcap)
         with open(wout, "rb") as f:
             tg("sendPhoto", {"caption": wcap}, files={"photo": f})
